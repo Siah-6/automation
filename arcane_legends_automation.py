@@ -34,31 +34,41 @@ class ScreenCapture:
         self.sct = mss.mss()
         self.monitors = self.sct.monitors
         self.monitor = self.monitors[monitor_index] if monitor_index < len(self.monitors) else self.monitors[1]
+        print(f"Using monitor {monitor_index}: {self.monitor}")
         
     def capture_region(self, region: Tuple[int, int, int, int] = None) -> np.ndarray:
         """Capture screen region (x, y, width, height)"""
         if region:
-            monitor = {"top": region[1], "left": region[0], "width": region[2], "height": region[3]}
+            # For fullscreen, regions are relative to full monitor
+            x, y, w, h = region
+            monitor = {"top": y + 0, "left": x + 0, "width": w, "height": h}
+            print(f"Capturing region: x={x}, y={y}, w={w}, h={h}")
         else:
-            monitor = self.monitor
-            
+            # Fullscreen game - use entire monitor
+            monitor = {
+                "top": 0,
+                "left": 0,
+                "width": 1920,
+                "height": 1080
+            }
+            print("Capturing fullscreen game window")
+
         img = self.sct.grab(monitor)
         return np.array(img)
-
 class VisualDetector:
     def __init__(self):
         self.enemy_templates = []
         self.loot_templates = []
         self.portal_templates = []
         
-        # Detection regions based on screenshots
-        self.hp_bar_region = (10, 10, 200, 40)  # Top left HP bar
-        self.energy_bar_region = (300, 10, 150, 40)  # Top center energy icons
-        self.skill_bar_region = (500, 520, 300, 80)  # Bottom right skills
-        self.hotbar_region = (520, 540, 200, 60)  # Bottom right hotbar items
-        self.combat_area_region = (100, 100, 600, 400)  # Main game area
-        self.portal_menu_region = (250, 200, 300, 200)  # Center menu area
-        self.interaction_button_region = (520, 540, 80, 80)  # Space button area
+        # Detection regions for fullscreen mode (game content starts at 168, 41)
+        self.hp_bar_region = (168+40, 41+40, 340, 110)  # (208, 81, 340, 110)
+        self.energy_bar_region = (750, 40, 400, 100)  # Back to working region
+        self.skill_bar_region = (168+1220, 41+520, 350, 340)  # (1388, 561, 350, 340)
+        self.hotbar_region = (168+1120, 41+240, 300, 200)  # (1288, 281, 300, 200)
+        self.combat_area_region = (168+260, 41+140, 820, 540)  # (428, 181, 820, 540)
+        self.portal_menu_region = (168+520, 41+150, 560, 520)  # (688, 191, 560, 520)
+        self.interaction_button_region = (1500, 850, 250, 180)  # Correct position for interaction button
         
     def load_templates(self):
         """Load template images for detection - user needs to provide these"""
@@ -179,53 +189,104 @@ class VisualDetector:
     
     def detect_energy_icons(self, frame: np.ndarray) -> int:
         """Count available energy icons from top UI"""
-        energy_region = frame[self.energy_bar_region[1]:self.energy_bar_region[1]+self.energy_bar_region[3],
-                             self.energy_bar_region[0]:self.energy_bar_region[0]+self.energy_bar_region[2]]
+        x, y, w, h = self.energy_bar_region
+        energy_region = frame[y:y+h, x:x+w]
         
         hsv = cv2.cvtColor(energy_region, cv2.COLOR_BGR2HSV)
         
-        # Detect green energy icons (HSV range for bright green)
-        lower_energy = np.array([40, 100, 100])
-        upper_energy = np.array([80, 255, 255])
+        # More inclusive HSV range for energy leaf icons
+        lower_energy = np.array([40, 80, 80])
+        upper_energy = np.array([85, 255, 255])
         mask = cv2.inRange(hsv, lower_energy, upper_energy)
         
-        # Find contours and count circular energy icons
+        
+        # Find contours and count energy icons
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        # Filter contours by position and size to isolate energy icons
         energy_count = 0
+        detected_positions = []
+        
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > 50:  # Filter small noise
-                # Check if contour is roughly circular
+            if 30 <= area <= 800:  # More inclusive size range for energy icons
+                # Check if contour is roughly circular/leaf-shaped
                 x, y, w, h = cv2.boundingRect(contour)
                 aspect_ratio = float(w) / h
-                if 0.7 <= aspect_ratio <= 1.3:  # Roughly circular
-                    energy_count += 1
+                if 0.6 <= aspect_ratio <= 1.4:  # More strict for leaf shapes
+                    # Energy icons are typically in a horizontal line at similar Y position
+                    # and have specific spacing between them
+                    detected_positions.append((x, y, w, h, area))
         
+        # Sort by X position (left to right)
+        detected_positions.sort(key=lambda pos: pos[0])
+        
+        # Filter for energy icon pattern: 3 icons in horizontal line with similar Y
+        if len(detected_positions) >= 2:
+            # Find the most common Y position (energy icons align horizontally)
+            y_positions = [pos[1] for pos in detected_positions]
+            most_common_y = max(set(y_positions), key=y_positions.count)
+            
+            # Count icons near this Y position (within 20 pixels)
+            for x, y, w, h, area in detected_positions:
+                if abs(y - most_common_y) <= 20:
+                    energy_count += 1
+                    # Draw bounding box for debugging
+                    cv2.rectangle(energy_region, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    cv2.putText(energy_region, f"Icon {energy_count}", (x, y-5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Energy should be 0-3, so cap it
+        energy_count = min(energy_count, 3)
+        
+        print(f"Energy detection: found {energy_count} icons, region: {self.energy_bar_region}")
         return energy_count
     
     def detect_green_portal(self, frame: np.ndarray) -> Optional[DetectedObject]:
-        """Detect glowing green portal in hub"""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Detect bright green portal glow
+    # Crop to gameplay area only
+        x, y, w, h = self.combat_area_region
+        region = frame[y:y+h, x:x+w]
+
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
         lower_portal = np.array([40, 150, 150])
         upper_portal = np.array([80, 255, 255])
         mask = cv2.inRange(hsv, lower_portal, upper_portal)
-        
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Find largest contour (likely the portal)
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            
-            if area > 500:  # Portal should be significant size
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                center = (x + w // 2, y + h // 2)
-                confidence = min(area / 2000, 1.0)
-                return DetectedObject(center, confidence, "green_portal")
-                
+
+        best = None
+        best_score = 0
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 1200:
+                continue
+
+            x2, y2, w2, h2 = cv2.boundingRect(contour)
+            aspect_ratio = w2 / float(h2)
+
+            # Portal should be a fairly tall glowing object, not a tiny green blob
+            if not (0.5 <= aspect_ratio <= 1.8):
+                continue
+
+            score = area
+            if score > best_score:
+                best_score = score
+                best = (x2, y2, w2, h2, area)
+
+        if best is not None:
+            x2, y2, w2, h2, area = best
+            cx = x + x2 + w2 // 2  # Add region offset to get full screen coordinates
+            cy = y + y2 + h2 // 2
+            center = (cx, cy)
+            confidence = min(area / 4000, 1.0)
+            return DetectedObject(center, confidence, "green_portal")
+
         return None
     
     def detect_interaction_button(self, frame: np.ndarray) -> bool:
@@ -235,17 +296,19 @@ class VisualDetector:
         
         hsv = cv2.cvtColor(button_region, cv2.COLOR_BGR2HSV)
         
-        # Detect interaction button (usually blue/purple glow)
-        lower_interact = np.array([100, 100, 100])
-        upper_interact = np.array([150, 255, 255])
+        # Detect interaction button (usually yellow/orange glow when near portal)
+        lower_interact = np.array([15, 100, 150])
+        upper_interact = np.array([60, 255, 255])
         mask = cv2.inRange(hsv, lower_interact, upper_interact)
+      
         
         # Check if there's significant interaction color
         interact_pixels = cv2.countNonZero(mask)
         total_pixels = button_region.shape[0] * button_region.shape[1]
         interact_ratio = interact_pixels / total_pixels if total_pixels > 0 else 0
         
-        return interact_ratio > 0.3  # Threshold for interaction button detection
+        print(f"Interaction detection: ratio={interact_ratio:.3f}, region={self.interaction_button_region}")
+        return interact_ratio > 0.1  # Lower threshold for better detection
     
     def detect_portal_menu_options(self, frame: np.ndarray) -> List[str]:
         """Detect available options in portal menu"""
@@ -329,76 +392,69 @@ class VisualDetector:
 class InputController:
     def __init__(self):
         pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.1
-        
+        pyautogui.PAUSE = 0.05
+        self.current_keys = set()
+
     def move_towards(self, target: Tuple[int, int], screen_center: Tuple[int, int]):
-        """Move character towards target position"""
+        """Move character towards target position with proper key hold/release"""
         dx = target[0] - screen_center[0]
         dy = target[1] - screen_center[1]
-        
-        # Normalize movement
-        distance = np.sqrt(dx**2 + dy**2)
-        if distance > 0:
-            dx /= distance
-            dy /= distance
-            
-        # Send movement keys (WASD)
-        if abs(dx) > 0.3:
-            if dx > 0:
-                pyautogui.keyDown('d')
-            else:
-                pyautogui.keyDown('a')
-        else:
-            pyautogui.keyUp('a')
-            pyautogui.keyUp('d')
-            
-        if abs(dy) > 0.3:
-            if dy > 0:
-                pyautogui.keyDown('s')
-            else:
-                pyautogui.keyDown('w')
-        else:
-            pyautogui.keyUp('w')
-            pyautogui.keyUp('s')
-    
+
+        keys_to_hold = set()
+
+        # Horizontal
+        if dx > 60:
+            keys_to_hold.add('d')
+        elif dx < -60:
+            keys_to_hold.add('a')
+
+        # Vertical
+        if dy > 60:
+            keys_to_hold.add('s')
+        elif dy < -60:
+            keys_to_hold.add('w')
+
+        # Release keys no longer needed
+        for key in self.current_keys - keys_to_hold:
+            pyautogui.keyUp(key)
+
+        # Press new keys
+        for key in keys_to_hold - self.current_keys:
+            pyautogui.keyDown(key)
+
+        self.current_keys = keys_to_hold
+
     def stop_movement(self):
         """Stop all movement"""
-        pyautogui.keyUp('w')
-        pyautogui.keyUp('a')
-        pyautogui.keyUp('s')
-        pyautogui.keyUp('d')
-    
+        for key in list(self.current_keys):
+            pyautogui.keyUp(key)
+        self.current_keys.clear()
+
     def use_skill(self, skill_index: int):
-        """Use skill by number (1-4)"""
         skill_keys = ['1', '2', '3', '4']
         if 0 <= skill_index < len(skill_keys):
             pyautogui.press(skill_keys[skill_index])
-    
+
     def pick_up_loot(self):
-        """Pick up nearby loot (usually spacebar or F)"""
         pyautogui.press('space')
-    
+
     def interact_with_portal(self):
-        """Interact with portal/exit"""
-        pyautogui.press('e')  # Common interaction key
-    
+        self.stop_movement()
+        time.sleep(0.1)
+        pyautogui.press('e')
+
     def click_position(self, position: Tuple[int, int]):
-        """Click at specific screen position"""
         pyautogui.click(position[0], position[1])
         time.sleep(0.2)
-    
+
     def use_energy_kit(self):
-        """Use energy refill kit from hotbar"""
-        # Usually mapped to a specific key (e.g., 'r' or number key)
-        pyautogui.press('r')  # Placeholder - adjust based on actual hotbar slot
-    
+        pyautogui.press('r')
+
     def select_menu_option(self, option_index: int):
-        """Select menu option by number (1=first, 2=second, etc.)"""
         pyautogui.press(str(option_index))
         time.sleep(0.3)
-    
+
     def confirm_action(self):
-        """Confirm action in dialog"""
         pyautogui.press('enter')
         time.sleep(0.3)
 
@@ -407,6 +463,9 @@ class DecisionEngine:
         self.detector = detector
         self.controller = controller
         self.current_state = GameState.IN_HUB
+        self.last_portal = None
+        self.last_portal_time = 0
+        self.portal_memory_time = 1.0  # seconds
         self.last_combat_time = 0
         self.combat_timeout = 3.0  # Seconds to wait after combat before moving to exit
         self.energy_threshold = 1  # Minimum energy to enter dungeon
@@ -414,12 +473,22 @@ class DecisionEngine:
         self.menu_action_delay = 1.0  # Delay between menu actions
         
     def update(self, frame: np.ndarray, screen_center: Tuple[int, int]):
-        """Main decision loop"""
-        # Detect all objects
         enemies = self.detector.detect_enemies(frame)
         loot = self.detector.detect_loot(frame)
         portal = self.detector.detect_portal(frame)
         green_portal = self.detector.detect_green_portal(frame)
+
+        print("STATE:", self.current_state)
+        print("green_portal:", green_portal.position if green_portal else None)
+
+        # Portal memory system
+        if green_portal:
+            self.last_portal = green_portal
+            self.last_portal_time = time.time()
+        else:
+            if time.time() - self.last_portal_time < self.portal_memory_time:
+                green_portal = self.last_portal
+        print("green_portal:", green_portal.position if green_portal else None)
         hp_level = self.detector.check_hp_bar(frame)
         skills_ready = self.detector.check_skill_cooldowns(frame)
         energy_count = self.detector.detect_energy_icons(frame)
@@ -430,6 +499,8 @@ class DecisionEngine:
         
         # State machine
         if self.current_state == GameState.IN_HUB:
+            # Stop movement when in hub (not moving to portal)
+            self.controller.stop_movement()
             # Check energy first
             if energy_count < self.energy_threshold:
                 self.current_state = GameState.LOW_ENERGY_REFILL
@@ -452,6 +523,8 @@ class DecisionEngine:
                 self.current_state = GameState.IN_HUB
                 
         elif self.current_state == GameState.PORTAL_MENU_OPEN:
+            # Stop movement when in menu
+            self.controller.stop_movement()
             if energy_confirmation:
                 self.current_state = GameState.ENERGY_CONFIRMATION
                 self.handle_energy_confirmation()
@@ -469,6 +542,8 @@ class DecisionEngine:
                 self.current_state = GameState.IN_DUNGEON
                 
         elif self.current_state == GameState.LOW_ENERGY_REFILL:
+            # Stop movement when refilling energy
+            self.controller.stop_movement()
             if energy_count >= self.energy_threshold:
                 self.current_state = GameState.IN_HUB
             elif energy_kit:
@@ -645,24 +720,29 @@ class ArcaneLegendsAutomation:
     
     def main_loop(self):
         """Main automation loop"""
+
         screen_width = self.screen_capture.monitor["width"]
         screen_height = self.screen_capture.monitor["height"]
         screen_center = (screen_width // 2, screen_height // 2)
-        
+
+        print("Capturing in 3 seconds... switch to the game window")
+        time.sleep(3)
+
         while self.running:
+
             start_time = time.time()
-            
+
             # Capture screen
             frame = self.screen_capture.capture_region()
-            
-            # Process frame and make decisions
+
+            # Run automation logic
             self.decision_engine.update(frame, screen_center)
-            
-            # Maintain target FPS
+
+            # Maintain FPS
             elapsed = time.time() - start_time
             if elapsed < self.frame_time:
                 time.sleep(self.frame_time - elapsed)
-
+            
 if __name__ == "__main__":
     automation = ArcaneLegendsAutomation()
     automation.start()
